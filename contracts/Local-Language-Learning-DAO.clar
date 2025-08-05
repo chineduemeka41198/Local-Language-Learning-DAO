@@ -346,11 +346,17 @@
 )
 (define-constant ERR-VOTING-ENDED (err u105))
 (define-constant ERR-VOTING-ACTIVE (err u106))
+(define-constant ERR-INSUFFICIENT-EXPERIENCE (err u107))
+(define-constant ERR-CERTIFICATION-EXISTS (err u108))
 
 (define-data-var proposal-counter uint u0)
 (define-data-var voting-period uint u1008)
 (define-data-var min-voting-power uint u1000)
 (define-data-var quorum-threshold uint u5000)
+
+(define-data-var certification-counter uint u0)
+(define-data-var min-score-for-cert uint u8000)
+(define-data-var min-content-for-cert uint u20)
 
 (define-map Proposals
     uint
@@ -387,6 +393,29 @@
         power: uint,
         last-updated: uint,
     }
+)
+
+(define-map Certifications
+    uint
+    {
+        holder: principal,
+        language: (string-ascii 10),
+        level: (string-ascii 20),
+        score: uint,
+        content-completed: uint,
+        issued-date: uint,
+        issuer: principal,
+        verification-hash: (string-ascii 64),
+    }
+)
+
+(define-map CertificationHolders
+    {
+        holder: principal,
+        language: (string-ascii 10),
+        level: (string-ascii 20),
+    }
+    uint
 )
 
 (define-public (create-proposal
@@ -599,5 +628,131 @@
         (var-set min-voting-power new-min-power)
         (var-set quorum-threshold new-quorum)
         (ok true)
+    )
+)
+
+(define-public (issue-certification
+        (candidate principal)
+        (language (string-ascii 10))
+        (level (string-ascii 20))
+        (verification-hash (string-ascii 64))
+    )
+    (let (
+            (cert-key {
+                holder: candidate,
+                language: language,
+                level: level,
+            })
+            (learner-stats (unwrap! (map-get? LearnerStats candidate) ERR-NOT-FOUND))
+            (cert-id (+ (var-get certification-counter) u1))
+            (current-time stacks-block-height)
+        )
+        (asserts! (is-eq tx-sender (var-get dao-owner)) ERR-NOT-AUTHORIZED)
+        (asserts!
+            (>= (get total-score learner-stats) (var-get min-score-for-cert))
+            ERR-INSUFFICIENT-EXPERIENCE
+        )
+        (asserts!
+            (>= (get total-completed learner-stats)
+                (var-get min-content-for-cert)
+            )
+            ERR-INSUFFICIENT-EXPERIENCE
+        )
+        (asserts! (is-none (map-get? CertificationHolders cert-key))
+            ERR-CERTIFICATION-EXISTS
+        )
+        (map-set Certifications cert-id {
+            holder: candidate,
+            language: language,
+            level: level,
+            score: (get total-score learner-stats),
+            content-completed: (get total-completed learner-stats),
+            issued-date: current-time,
+            issuer: tx-sender,
+            verification-hash: verification-hash,
+        })
+        (map-set CertificationHolders cert-key cert-id)
+        (var-set certification-counter cert-id)
+        (ok cert-id)
+    )
+)
+
+(define-public (revoke-certification (cert-id uint))
+    (let ((certification (unwrap! (map-get? Certifications cert-id) ERR-NOT-FOUND)))
+        (asserts! (is-eq tx-sender (var-get dao-owner)) ERR-NOT-AUTHORIZED)
+        (map-delete Certifications cert-id)
+        (map-delete CertificationHolders {
+            holder: (get holder certification),
+            language: (get language certification),
+            level: (get level certification),
+        })
+        (ok true)
+    )
+)
+
+(define-public (update-certification-requirements
+        (new-min-score uint)
+        (new-min-content uint)
+    )
+    (begin
+        (asserts! (is-eq tx-sender (var-get dao-owner)) ERR-NOT-AUTHORIZED)
+        (var-set min-score-for-cert new-min-score)
+        (var-set min-content-for-cert new-min-content)
+        (ok true)
+    )
+)
+
+(define-read-only (get-certification (cert-id uint))
+    (ok (unwrap! (map-get? Certifications cert-id) ERR-NOT-FOUND))
+)
+
+(define-read-only (get-user-certification
+        (holder principal)
+        (language (string-ascii 10))
+        (level (string-ascii 20))
+    )
+    (let ((cert-key {
+            holder: holder,
+            language: language,
+            level: level,
+        }))
+        (match (map-get? CertificationHolders cert-key)
+            cert-id (map-get? Certifications cert-id)
+            none
+        )
+    )
+)
+
+(define-read-only (verify-certification
+        (cert-id uint)
+        (expected-hash (string-ascii 64))
+    )
+    (let ((certification (unwrap! (map-get? Certifications cert-id) ERR-NOT-FOUND)))
+        (ok (is-eq (get verification-hash certification) expected-hash))
+    )
+)
+
+(define-read-only (get-certification-requirements)
+    (ok {
+        min-score: (var-get min-score-for-cert),
+        min-content: (var-get min-content-for-cert),
+        certification-counter: (var-get certification-counter),
+    })
+)
+
+(define-read-only (check-certification-eligibility (candidate principal))
+    (let ((learner-stats (unwrap! (map-get? LearnerStats candidate) ERR-NOT-FOUND)))
+        (ok {
+            eligible: (and
+                (>= (get total-score learner-stats) (var-get min-score-for-cert))
+                (>= (get total-completed learner-stats)
+                    (var-get min-content-for-cert)
+                )
+            ),
+            current-score: (get total-score learner-stats),
+            current-completed: (get total-completed learner-stats),
+            score-needed: (var-get min-score-for-cert),
+            content-needed: (var-get min-content-for-cert),
+        })
     )
 )
