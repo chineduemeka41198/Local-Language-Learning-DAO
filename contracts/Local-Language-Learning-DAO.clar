@@ -348,6 +348,8 @@
 (define-constant ERR-VOTING-ACTIVE (err u106))
 (define-constant ERR-INSUFFICIENT-EXPERIENCE (err u107))
 (define-constant ERR-CERTIFICATION-EXISTS (err u108))
+(define-constant ERR-CONTENT-NOT-PREMIUM (err u109))
+(define-constant ERR-ALREADY-PURCHASED (err u110))
 
 (define-data-var proposal-counter uint u0)
 (define-data-var voting-period uint u1008)
@@ -357,6 +359,9 @@
 (define-data-var certification-counter uint u0)
 (define-data-var min-score-for-cert uint u8000)
 (define-data-var min-content-for-cert uint u20)
+
+(define-data-var marketplace-fee-rate uint u500)
+(define-data-var total-marketplace-volume uint u0)
 
 (define-map Proposals
     uint
@@ -416,6 +421,36 @@
         level: (string-ascii 20),
     }
     uint
+)
+
+(define-map ContentPricing
+    uint
+    {
+        price: uint,
+        is-premium: bool,
+        sales-count: uint,
+        total-revenue: uint,
+    }
+)
+
+(define-map ContentPurchases
+    {
+        buyer: principal,
+        content-id: uint,
+    }
+    {
+        purchase-date: uint,
+        price-paid: uint,
+    }
+)
+
+(define-map CreatorEarnings
+    principal
+    {
+        total-earned: uint,
+        total-sales: uint,
+        content-sold: uint,
+    }
 )
 
 (define-public (create-proposal
@@ -754,5 +789,156 @@
             score-needed: (var-get min-score-for-cert),
             content-needed: (var-get min-content-for-cert),
         })
+    )
+)
+
+(define-public (set-content-price
+        (content-id uint)
+        (price uint)
+    )
+    (let ((content (unwrap! (map-get? LearningContent content-id) ERR-NOT-FOUND)))
+        (asserts! (is-eq (get creator content) tx-sender) ERR-NOT-AUTHORIZED)
+        (map-set ContentPricing content-id {
+            price: price,
+            is-premium: (> price u0),
+            sales-count: u0,
+            total-revenue: u0,
+        })
+        (ok true)
+    )
+)
+
+(define-public (purchase-content (content-id uint))
+    (let (
+            (content (unwrap! (map-get? LearningContent content-id) ERR-NOT-FOUND))
+            (pricing (unwrap! (map-get? ContentPricing content-id) ERR-CONTENT-NOT-PREMIUM))
+            (purchase-key {
+                buyer: tx-sender,
+                content-id: content-id,
+            })
+            (creator (get creator content))
+            (price (get price pricing))
+            (fee-amount (/ (* price (var-get marketplace-fee-rate)) u10000))
+            (creator-amount (- price fee-amount))
+            (current-earnings (default-to {
+                total-earned: u0,
+                total-sales: u0,
+                content-sold: u0,
+            }
+                (map-get? CreatorEarnings creator)
+            ))
+        )
+        (asserts! (get is-premium pricing) ERR-CONTENT-NOT-PREMIUM)
+        (asserts! (not (is-eq creator tx-sender)) ERR-NOT-AUTHORIZED)
+        (asserts! (is-none (map-get? ContentPurchases purchase-key))
+            ERR-ALREADY-PURCHASED
+        )
+        (asserts! (>= (stx-get-balance tx-sender) price) ERR-INSUFFICIENT-FUNDS)
+        (try! (stx-transfer? fee-amount tx-sender (var-get dao-owner)))
+        (try! (stx-transfer? creator-amount tx-sender creator))
+        (map-set ContentPurchases purchase-key {
+            purchase-date: stacks-block-height,
+            price-paid: price,
+        })
+        (map-set ContentPricing content-id
+            (merge pricing {
+                sales-count: (+ (get sales-count pricing) u1),
+                total-revenue: (+ (get total-revenue pricing) price),
+            })
+        )
+        (map-set CreatorEarnings creator {
+            total-earned: (+ (get total-earned current-earnings) creator-amount),
+            total-sales: (+ (get total-sales current-earnings) u1),
+            content-sold: (+ (get content-sold current-earnings)
+                (if (is-eq (get sales-count pricing) u0)
+                    u1
+                    u0
+                )),
+        })
+        (var-set total-marketplace-volume
+            (+ (var-get total-marketplace-volume) price)
+        )
+        (ok true)
+    )
+)
+
+(define-public (update-marketplace-fee (new-fee-rate uint))
+    (begin
+        (asserts! (is-eq tx-sender (var-get dao-owner)) ERR-NOT-AUTHORIZED)
+        (asserts! (<= new-fee-rate u2000) ERR-INVALID-INPUT)
+        (var-set marketplace-fee-rate new-fee-rate)
+        (ok true)
+    )
+)
+
+(define-read-only (get-content-pricing (content-id uint))
+    (ok (map-get? ContentPricing content-id))
+)
+
+(define-read-only (has-purchased-content
+        (buyer principal)
+        (content-id uint)
+    )
+    (ok (is-some (map-get? ContentPurchases {
+        buyer: buyer,
+        content-id: content-id,
+    })))
+)
+
+(define-read-only (get-creator-earnings (creator principal))
+    (ok (default-to {
+        total-earned: u0,
+        total-sales: u0,
+        content-sold: u0,
+    }
+        (map-get? CreatorEarnings creator)
+    ))
+)
+
+(define-read-only (get-marketplace-stats)
+    (ok {
+        fee-rate: (var-get marketplace-fee-rate),
+        total-volume: (var-get total-marketplace-volume),
+    })
+)
+
+(define-read-only (can-access-content
+        (user principal)
+        (content-id uint)
+    )
+    (let (
+            (content (unwrap! (map-get? LearningContent content-id) ERR-NOT-FOUND))
+            (pricing (map-get? ContentPricing content-id))
+        )
+        (ok (or
+            (is-eq user (get creator content))
+            (match pricing
+                some-pricing (if (get is-premium some-pricing)
+                    (is-some (map-get? ContentPurchases {
+                        buyer: user,
+                        content-id: content-id,
+                    }))
+                    true
+                )
+                true
+            )
+        ))
+    )
+)
+
+(define-read-only (get-premium-content-list (limit uint))
+    (ok (filter is-premium-content
+        (list
+            u1             u2             u3             u4             u5
+                        u6             u7             u8             u9             u10
+            u11             u12             u13             u14             u15
+                        u16             u17             u18             u19             u20
+        )))
+)
+
+(define-private (is-premium-content (content-id uint))
+    (match (map-get? ContentPricing content-id)
+        pricing (get is-premium pricing)
+        false
     )
 )
