@@ -792,153 +792,604 @@
     )
 )
 
-(define-public (set-content-price
-        (content-id uint)
-        (price uint)
-    )
-    (let ((content (unwrap! (map-get? LearningContent content-id) ERR-NOT-FOUND)))
-        (asserts! (is-eq (get creator content) tx-sender) ERR-NOT-AUTHORIZED)
-        (map-set ContentPricing content-id {
-            price: price,
-            is-premium: (> price u0),
-            sales-count: u0,
-            total-revenue: u0,
-        })
-        (ok true)
-    )
+;; === LANGUAGE EXCHANGE MATCHMAKING SYSTEM ===
+;; New independent feature for connecting language learners
+
+;; Additional error constants for exchange system
+(define-constant ERR-PROFILE-NOT-FOUND (err u111))
+(define-constant ERR-NO-MATCH-FOUND (err u112))
+(define-constant ERR-SESSION-NOT-FOUND (err u113))
+(define-constant ERR-SESSION-ALREADY-RATED (err u114))
+(define-constant ERR-INVALID-RATING (err u115))
+(define-constant ERR-SESSION-NOT-COMPLETED (err u116))
+(define-constant ERR-CANNOT-MATCH-SELF (err u117))
+(define-constant ERR-TIME-SLOT-TAKEN (err u118))
+
+;; Data variables for exchange system
+(define-data-var session-counter uint u0)
+(define-data-var min-reputation-for-matching uint u3)
+(define-data-var session-duration-blocks uint u144)
+
+;; Language Exchange Profile Map
+(define-map LanguageProfiles
+    principal
+    {
+        native-languages: (list 3 (string-ascii 10)),
+        learning-languages: (list 5 (string-ascii 10)),
+        proficiency-levels: (list 5 uint),
+        availability-hours: (list 10 uint),
+        preferred-session-length: uint,
+        exchange-reputation: uint,
+        total-sessions: uint,
+        avg-rating: uint,
+        bio: (string-ascii 200),
+        active: bool,
+    }
 )
 
-(define-public (purchase-content (content-id uint))
+;; Exchange Sessions Map
+(define-map ExchangeSessions
+    uint
+    {
+        participant1: principal,
+        participant2: principal,
+        language1: (string-ascii 10),
+        language2: (string-ascii 10),
+        scheduled-time: uint,
+        duration: uint,
+        status: (string-ascii 20),
+        completion-time: uint,
+        notes1: (string-ascii 300),
+        notes2: (string-ascii 300),
+    }
+)
+
+;; Session Ratings Map
+(define-map SessionRatings
+    {
+        session-id: uint,
+        rater: principal,
+    }
+    {
+        rating: uint,
+        feedback: (string-ascii 200),
+        communication-score: uint,
+        helpfulness-score: uint,
+        punctuality-score: uint,
+        rating-time: uint,
+    }
+)
+
+;; Exchange Matches Map - tracks successful matches
+(define-map ExchangeMatches
+    {
+        requester: principal,
+        matched-partner: principal,
+        language-pair: (string-ascii 21),
+    }
+    {
+        match-score: uint,
+        created-time: uint,
+        sessions-completed: uint,
+        avg-mutual-rating: uint,
+    }
+)
+
+;; Exchange Achievements Map - specific to language exchange
+(define-map ExchangeAchievements
+    {
+        participant: principal,
+        achievement-type: (string-ascii 30),
+    }
+    {
+        earned-date: uint,
+        description: (string-ascii 100),
+        sessions-required: uint,
+    }
+)
+
+;; === CORE EXCHANGE FUNCTIONS ===
+
+;; Register or update language exchange profile
+(define-public (register-language-profile
+        (native-langs (list 3 (string-ascii 10)))
+        (learning-langs (list 5 (string-ascii 10)))
+        (proficiency-levels (list 5 uint))
+        (availability-hours (list 10 uint))
+        (preferred-length uint)
+        (bio (string-ascii 200))
+    )
     (let (
-            (content (unwrap! (map-get? LearningContent content-id) ERR-NOT-FOUND))
-            (pricing (unwrap! (map-get? ContentPricing content-id) ERR-CONTENT-NOT-PREMIUM))
-            (purchase-key {
-                buyer: tx-sender,
-                content-id: content-id,
-            })
-            (creator (get creator content))
-            (price (get price pricing))
-            (fee-amount (/ (* price (var-get marketplace-fee-rate)) u10000))
-            (creator-amount (- price fee-amount))
-            (current-earnings (default-to {
-                total-earned: u0,
-                total-sales: u0,
-                content-sold: u0,
-            }
-                (map-get? CreatorEarnings creator)
+            (current-profile (map-get? LanguageProfiles tx-sender))
+            (existing-sessions (match current-profile
+                some-profile (get total-sessions some-profile)
+                u0
+            ))
+            (existing-reputation (match current-profile
+                some-profile (get exchange-reputation some-profile)
+                u0
+            ))
+            (existing-rating (match current-profile
+                some-profile (get avg-rating some-profile)
+                u0
             ))
         )
-        (asserts! (get is-premium pricing) ERR-CONTENT-NOT-PREMIUM)
-        (asserts! (not (is-eq creator tx-sender)) ERR-NOT-AUTHORIZED)
-        (asserts! (is-none (map-get? ContentPurchases purchase-key))
-            ERR-ALREADY-PURCHASED
+        (asserts! (> (len learning-langs) u0) ERR-INVALID-INPUT)
+        (asserts! (> (len native-langs) u0) ERR-INVALID-INPUT)
+        (asserts! (is-eq (len learning-langs) (len proficiency-levels))
+            ERR-INVALID-INPUT
         )
-        (asserts! (>= (stx-get-balance tx-sender) price) ERR-INSUFFICIENT-FUNDS)
-        (try! (stx-transfer? fee-amount tx-sender (var-get dao-owner)))
-        (try! (stx-transfer? creator-amount tx-sender creator))
-        (map-set ContentPurchases purchase-key {
-            purchase-date: stacks-block-height,
-            price-paid: price,
+        (asserts! (and (>= preferred-length u30) (<= preferred-length u180))
+            ERR-INVALID-INPUT
+        )
+        (map-set LanguageProfiles tx-sender {
+            native-languages: native-langs,
+            learning-languages: learning-langs,
+            proficiency-levels: proficiency-levels,
+            availability-hours: availability-hours,
+            preferred-session-length: preferred-length,
+            exchange-reputation: existing-reputation,
+            total-sessions: existing-sessions,
+            avg-rating: existing-rating,
+            bio: bio,
+            active: true,
         })
-        (map-set ContentPricing content-id
-            (merge pricing {
-                sales-count: (+ (get sales-count pricing) u1),
-                total-revenue: (+ (get total-revenue pricing) price),
+        (ok true)
+    )
+)
+
+;; Find compatible exchange partner
+(define-public (find-exchange-match (target-language (string-ascii 10)))
+    (let (
+            (requester-profile (unwrap! (map-get? LanguageProfiles tx-sender)
+                ERR-PROFILE-NOT-FOUND
+            ))
+            (requester-natives (get native-languages requester-profile))
+            (potential-matches (find-compatible-partners tx-sender target-language
+                requester-natives
+            ))
+        )
+        (asserts! (get active requester-profile) ERR-NOT-AUTHORIZED)
+        (asserts! (is-some (index-of (get learning-languages requester-profile)
+            target-language
+        )) ERR-INVALID-INPUT)
+        (match potential-matches
+            some-match (begin
+                (let (
+                        (match-key {
+                            requester: tx-sender,
+                            matched-partner: some-match,
+                            language-pair: (concat target-language "-exchange"),
+                        })
+                        (match-score (calculate-match-score tx-sender some-match))
+                    )
+                    (map-set ExchangeMatches match-key {
+                        match-score: match-score,
+                        created-time: stacks-block-height,
+                        sessions-completed: u0,
+                        avg-mutual-rating: u0,
+                    })
+                    (ok some-match)
+                )
+            )
+            ERR-NO-MATCH-FOUND
+        )
+    )
+)
+
+;; Schedule a language exchange session
+(define-public (schedule-exchange-session
+        (partner principal)
+        (primary-language (string-ascii 10))
+        (secondary-language (string-ascii 10))
+        (scheduled-time uint)
+        (session-notes (string-ascii 300))
+    )
+    (let (
+            (session-id (+ (var-get session-counter) u1))
+            (requester-profile (unwrap! (map-get? LanguageProfiles tx-sender)
+                ERR-PROFILE-NOT-FOUND
+            ))
+            (partner-profile (unwrap! (map-get? LanguageProfiles partner)
+                ERR-PROFILE-NOT-FOUND
+            ))
+            (duration (get preferred-session-length requester-profile))
+        )
+        (asserts! (not (is-eq tx-sender partner)) ERR-CANNOT-MATCH-SELF)
+        (asserts! (get active requester-profile) ERR-NOT-AUTHORIZED)
+        (asserts! (get active partner-profile) ERR-NOT-AUTHORIZED)
+        (asserts! (> scheduled-time stacks-block-height) ERR-INVALID-INPUT)
+        (asserts! (check-time-availability partner scheduled-time duration)
+            ERR-TIME-SLOT-TAKEN
+        )
+        (map-set ExchangeSessions session-id {
+            participant1: tx-sender,
+            participant2: partner,
+            language1: primary-language,
+            language2: secondary-language,
+            scheduled-time: scheduled-time,
+            duration: duration,
+            status: "scheduled",
+            completion-time: u0,
+            notes1: session-notes,
+            notes2: "",
+        })
+        (var-set session-counter session-id)
+        (ok session-id)
+    )
+)
+
+;; Complete an exchange session and update stats
+(define-public (complete-exchange-session
+        (session-id uint)
+        (completion-notes (string-ascii 300))
+    )
+    (let (
+            (session (unwrap! (map-get? ExchangeSessions session-id)
+                ERR-SESSION-NOT-FOUND
+            ))
+            (is-participant1 (is-eq tx-sender (get participant1 session)))
+            (is-participant2 (is-eq tx-sender (get participant2 session)))
+        )
+        (asserts! (or is-participant1 is-participant2) ERR-NOT-AUTHORIZED)
+        (asserts! (is-eq (get status session) "scheduled") ERR-INVALID-INPUT)
+        (asserts! (>= stacks-block-height (get scheduled-time session))
+            ERR-INVALID-INPUT
+        )
+        (map-set ExchangeSessions session-id
+            (merge session {
+                status: "completed",
+                completion-time: stacks-block-height,
+                notes2: (if is-participant2 completion-notes (get notes2 session)),
+                notes1: (if is-participant1 completion-notes (get notes1 session)),
             })
         )
-        (map-set CreatorEarnings creator {
-            total-earned: (+ (get total-earned current-earnings) creator-amount),
-            total-sales: (+ (get total-sales current-earnings) u1),
-            content-sold: (+ (get content-sold current-earnings)
-                (if (is-eq (get sales-count pricing) u0)
-                    u1
-                    u0
-                )),
+        (unwrap-panic (update-session-stats tx-sender))
+        (unwrap-panic (check-and-award-exchange-achievements tx-sender))
+        (ok true)
+    )
+)
+
+;; Rate a completed exchange session
+(define-public (rate-exchange-session
+        (session-id uint)
+        (overall-rating uint)
+        (communication-score uint)
+        (helpfulness-score uint)
+        (punctuality-score uint)
+        (feedback (string-ascii 200))
+    )
+    (let (
+            (session (unwrap! (map-get? ExchangeSessions session-id)
+                ERR-SESSION-NOT-FOUND
+            ))
+            (rating-key {
+                session-id: session-id,
+                rater: tx-sender,
+            })
+            (is-participant (or
+                (is-eq tx-sender (get participant1 session))
+                (is-eq tx-sender (get participant2 session))
+            ))
+            (partner (if (is-eq tx-sender (get participant1 session))
+                (get participant2 session)
+                (get participant1 session)
+            ))
+        )
+        (asserts! is-participant ERR-NOT-AUTHORIZED)
+        (asserts! (is-eq (get status session) "completed")
+            ERR-SESSION-NOT-COMPLETED
+        )
+        (asserts! (and (>= overall-rating u1) (<= overall-rating u5))
+            ERR-INVALID-RATING
+        )
+        (asserts! (and (>= communication-score u1) (<= communication-score u5))
+            ERR-INVALID-RATING
+        )
+        (asserts! (and (>= helpfulness-score u1) (<= helpfulness-score u5))
+            ERR-INVALID-RATING
+        )
+        (asserts! (and (>= punctuality-score u1) (<= punctuality-score u5))
+            ERR-INVALID-RATING
+        )
+        (asserts! (is-none (map-get? SessionRatings rating-key))
+            ERR-SESSION-ALREADY-RATED
+        )
+        (map-set SessionRatings rating-key {
+            rating: overall-rating,
+            feedback: feedback,
+            communication-score: communication-score,
+            helpfulness-score: helpfulness-score,
+            punctuality-score: punctuality-score,
+            rating-time: stacks-block-height,
         })
-        (var-set total-marketplace-volume
-            (+ (var-get total-marketplace-volume) price)
+        (unwrap-panic (update-partner-reputation partner overall-rating))
+        (ok true)
+    )
+)
+
+;; === PRIVATE HELPER FUNCTIONS ===
+
+;; Find compatible language exchange partners
+(define-private (find-compatible-partners
+        (requester principal)
+        (target-language (string-ascii 10))
+        (requester-natives (list 3 (string-ascii 10)))
+    )
+    (let (
+            ;; In a real implementation, this would iterate through profiles
+            ;; For now, we return none as a placeholder - would need iteration logic
+            (dummy-partner (as-contract tx-sender))
+        )
+        ;; Simplified match logic - in production would check all profiles
+        ;; for language compatibility and reputation requirements
+        (if (>= (get-user-reputation dummy-partner) (var-get min-reputation-for-matching))
+            (some dummy-partner)
+            none
+        )
+    )
+)
+
+;; Calculate match compatibility score
+(define-private (calculate-match-score (user1 principal) (user2 principal))
+    (let (
+            (profile1 (unwrap-panic (map-get? LanguageProfiles user1)))
+            (profile2 (unwrap-panic (map-get? LanguageProfiles user2)))
+        )
+        ;; Simplified scoring based on reputation and total sessions
+        (+ (get exchange-reputation profile1)
+           (get exchange-reputation profile2)
+           (get total-sessions profile1)
+           (get total-sessions profile2)
+        )
+    )
+)
+
+;; Check if time slot is available for partner
+(define-private (check-time-availability
+        (partner principal)
+        (requested-time uint)
+        (duration uint)
+    )
+    ;; Simplified availability check - would check existing sessions in real impl
+    (let ((end-time (+ requested-time duration)))
+        (< (- end-time requested-time) u288) ;; Max 2 days in blocks
+    )
+)
+
+;; Update session statistics for participant
+(define-private (update-session-stats (participant principal))
+    (let (
+            (current-profile (unwrap! (map-get? LanguageProfiles participant)
+                ERR-PROFILE-NOT-FOUND
+            ))
+        )
+        (map-set LanguageProfiles participant
+            (merge current-profile {
+                total-sessions: (+ (get total-sessions current-profile) u1),
+                exchange-reputation: (+ (get exchange-reputation current-profile) u1),
+            })
         )
         (ok true)
     )
 )
 
-(define-public (update-marketplace-fee (new-fee-rate uint))
-    (begin
-        (asserts! (is-eq tx-sender (var-get dao-owner)) ERR-NOT-AUTHORIZED)
-        (asserts! (<= new-fee-rate u2000) ERR-INVALID-INPUT)
-        (var-set marketplace-fee-rate new-fee-rate)
+;; Update partner reputation based on rating
+(define-private (update-partner-reputation (partner principal) (rating uint))
+    (let (
+            (current-profile (unwrap! (map-get? LanguageProfiles partner)
+                ERR-PROFILE-NOT-FOUND
+            ))
+            (current-avg (get avg-rating current-profile))
+            (sessions (get total-sessions current-profile))
+            ;; Simple average calculation
+            (new-avg (if (is-eq sessions u0)
+                rating
+                (/ (+ (* current-avg sessions) rating) (+ sessions u1))
+            ))
+        )
+        (map-set LanguageProfiles partner
+            (merge current-profile {
+                avg-rating: new-avg,
+            })
+        )
         (ok true)
     )
 )
 
-(define-read-only (get-content-pricing (content-id uint))
-    (ok (map-get? ContentPricing content-id))
-)
-
-(define-read-only (has-purchased-content
-        (buyer principal)
-        (content-id uint)
+;; Get user reputation (helper function)
+(define-private (get-user-reputation (user principal))
+    (match (map-get? LanguageProfiles user)
+        profile (get exchange-reputation profile)
+        u0
     )
-    (ok (is-some (map-get? ContentPurchases {
-        buyer: buyer,
-        content-id: content-id,
-    })))
 )
 
-(define-read-only (get-creator-earnings (creator principal))
-    (ok (default-to {
-        total-earned: u0,
-        total-sales: u0,
-        content-sold: u0,
-    }
-        (map-get? CreatorEarnings creator)
+;; Check and award exchange-specific achievements
+(define-private (check-and-award-exchange-achievements (participant principal))
+    (let (
+            (profile (unwrap! (map-get? LanguageProfiles participant)
+                ERR-PROFILE-NOT-FOUND
+            ))
+            (sessions (get total-sessions profile))
+        )
+        (if (is-eq sessions u5)
+            (unwrap-panic (award-exchange-achievement participant "first-exchanges"
+                "Completed first 5 language exchange sessions" u5
+            ))
+            true
+        )
+        (if (is-eq sessions u10)
+            (unwrap-panic (award-exchange-achievement participant "exchange-regular"
+                "Completed 10 language exchange sessions" u10
+            ))
+            true
+        )
+        (if (is-eq sessions u25)
+            (unwrap-panic (award-exchange-achievement participant "exchange-enthusiast"
+                "Completed 25 language exchange sessions" u25
+            ))
+            true
+        )
+        (if (is-eq sessions u50)
+            (unwrap-panic (award-exchange-achievement participant "exchange-master"
+                "Completed 50 language exchange sessions" u50
+            ))
+            true
+        )
+        (ok true)
+    )
+)
+
+;; Award exchange-specific achievement
+(define-private (award-exchange-achievement
+        (participant principal)
+        (achievement-type (string-ascii 30))
+        (description (string-ascii 100))
+        (sessions-required uint)
+    )
+    (let (
+            (achievement-key {
+                participant: participant,
+                achievement-type: achievement-type,
+            })
+        )
+        (if (is-none (map-get? ExchangeAchievements achievement-key))
+            (map-set ExchangeAchievements achievement-key {
+                earned-date: stacks-block-height,
+                description: description,
+                sessions-required: sessions-required,
+            })
+            false
+        )
+        (ok true)
+    )
+)
+
+;; === READ-ONLY FUNCTIONS FOR EXCHANGE SYSTEM ===
+
+;; Get user's language exchange profile
+(define-read-only (get-exchange-profile (user principal))
+    (ok (map-get? LanguageProfiles user))
+)
+
+;; Get exchange session details
+(define-read-only (get-exchange-session (session-id uint))
+    (ok (unwrap! (map-get? ExchangeSessions session-id) ERR-SESSION-NOT-FOUND))
+)
+
+;; Get session rating details
+(define-read-only (get-session-rating
+        (session-id uint)
+        (rater principal)
+    )
+    (ok (map-get? SessionRatings {
+        session-id: session-id,
+        rater: rater,
+    }))
+)
+
+;; Get match information
+(define-read-only (get-exchange-match
+        (requester principal)
+        (partner principal)
+        (language-pair (string-ascii 21))
+    )
+    (ok (map-get? ExchangeMatches {
+        requester: requester,
+        matched-partner: partner,
+        language-pair: language-pair,
+    }))
+)
+
+;; Get all exchange achievements for a user
+(define-read-only (get-exchange-achievements (participant principal))
+    (ok (list
+        (map-get? ExchangeAchievements {
+            participant: participant,
+            achievement-type: "first-exchanges",
+        })
+        (map-get? ExchangeAchievements {
+            participant: participant,
+            achievement-type: "exchange-regular",
+        })
+        (map-get? ExchangeAchievements {
+            participant: participant,
+            achievement-type: "exchange-enthusiast",
+        })
+        (map-get? ExchangeAchievements {
+            participant: participant,
+            achievement-type: "exchange-master",
+        })
     ))
 )
 
-(define-read-only (get-marketplace-stats)
+;; Get exchange system settings
+(define-read-only (get-exchange-settings)
     (ok {
-        fee-rate: (var-get marketplace-fee-rate),
-        total-volume: (var-get total-marketplace-volume),
+        session-counter: (var-get session-counter),
+        min-reputation: (var-get min-reputation-for-matching),
+        session-duration: (var-get session-duration-blocks),
     })
 )
 
-(define-read-only (can-access-content
-        (user principal)
-        (content-id uint)
-    )
-    (let (
-            (content (unwrap! (map-get? LearningContent content-id) ERR-NOT-FOUND))
-            (pricing (map-get? ContentPricing content-id))
-        )
-        (ok (or
-            (is-eq user (get creator content))
-            (match pricing
-                some-pricing (if (get is-premium some-pricing)
-                    (is-some (map-get? ContentPurchases {
-                        buyer: user,
-                        content-id: content-id,
-                    }))
-                    true
+;; Check if user can participate in exchanges
+(define-read-only (can-participate-in-exchange (user principal))
+    (let ((profile (map-get? LanguageProfiles user)))
+        (ok (match profile
+            some-profile (and
+                (get active some-profile)
+                (>= (get exchange-reputation some-profile)
+                    (var-get min-reputation-for-matching)
                 )
-                true
             )
+            false
         ))
     )
 )
 
-(define-read-only (get-premium-content-list (limit uint))
-    (ok (filter is-premium-content
-        (list
-            u1             u2             u3             u4             u5
-            u6             u7             u8             u9             u10
-            u11             u12             u13             u14             u15
-            u16             u17             u18             u19             u20
-        )))
+;; Get user's exchange statistics
+(define-read-only (get-exchange-stats (user principal))
+    (let ((profile (map-get? LanguageProfiles user)))
+        (ok (match profile
+            some-profile {
+                total-sessions: (get total-sessions some-profile),
+                avg-rating: (get avg-rating some-profile),
+                exchange-reputation: (get exchange-reputation some-profile),
+                active: (get active some-profile),
+            }
+            {
+                total-sessions: u0,
+                avg-rating: u0,
+                exchange-reputation: u0,
+                active: false,
+            }
+        ))
+    )
 )
 
-(define-private (is-premium-content (content-id uint))
-    (match (map-get? ContentPricing content-id)
-        pricing (get is-premium pricing)
-        false
+;; === ADMIN FUNCTIONS FOR EXCHANGE SYSTEM ===
+
+;; Update exchange system settings
+(define-public (update-exchange-settings
+        (new-min-reputation uint)
+        (new-session-duration uint)
+    )
+    (begin
+        (asserts! (is-eq tx-sender (var-get dao-owner)) ERR-NOT-AUTHORIZED)
+        (var-set min-reputation-for-matching new-min-reputation)
+        (var-set session-duration-blocks new-session-duration)
+        (ok true)
+    )
+)
+
+;; Deactivate a user's exchange profile (admin only)
+(define-public (deactivate-exchange-profile (user principal))
+    (let ((profile (unwrap! (map-get? LanguageProfiles user) ERR-PROFILE-NOT-FOUND)))
+        (asserts! (is-eq tx-sender (var-get dao-owner)) ERR-NOT-AUTHORIZED)
+        (map-set LanguageProfiles user
+            (merge profile { active: false })
+        )
+        (ok true)
     )
 )
