@@ -453,6 +453,127 @@
     }
 )
 
+(define-public (set-content-pricing
+        (content-id uint)
+        (price uint)
+        (is-premium bool)
+    )
+    (let (
+            (content (unwrap! (map-get? LearningContent content-id) ERR-NOT-FOUND))
+            (existing (default-to {
+                price: u0,
+                is-premium: false,
+                sales-count: u0,
+                total-revenue: u0,
+            }
+                (map-get? ContentPricing content-id)
+            ))
+        )
+        (asserts!
+            (or
+                (is-eq tx-sender (get creator content))
+                (is-eq tx-sender (var-get dao-owner))
+            )
+            ERR-NOT-AUTHORIZED
+        )
+        (asserts! (or (not is-premium) (> price u0)) ERR-INVALID-INPUT)
+        (map-set ContentPricing content-id {
+            price: price,
+            is-premium: is-premium,
+            sales-count: (get sales-count existing),
+            total-revenue: (get total-revenue existing),
+        })
+        (ok true)
+    )
+)
+
+(define-public (purchase-content (content-id uint))
+    (let (
+            (pricing (unwrap! (map-get? ContentPricing content-id) ERR-NOT-FOUND))
+            (content (unwrap! (map-get? LearningContent content-id) ERR-NOT-FOUND))
+            (key {
+                buyer: tx-sender,
+                content-id: content-id,
+            })
+            (price (get price pricing))
+            (fee (/ (* price (var-get marketplace-fee-rate)) u10000))
+            (net (- price fee))
+            (creator (get creator content))
+            (earnings (default-to {
+                total-earned: u0,
+                total-sales: u0,
+                content-sold: u0,
+            }
+                (map-get? CreatorEarnings creator)
+            ))
+        )
+        (asserts! (get is-premium pricing) ERR-CONTENT-NOT-PREMIUM)
+        (asserts! (is-none (map-get? ContentPurchases key)) ERR-ALREADY-PURCHASED)
+        (asserts! (>= (stx-get-balance tx-sender) price) ERR-INSUFFICIENT-FUNDS)
+        (try! (stx-transfer? fee tx-sender (var-get dao-owner)))
+        (try! (stx-transfer? net tx-sender creator))
+        (map-set ContentPurchases key {
+            purchase-date: stacks-block-height,
+            price-paid: price,
+        })
+        (map-set ContentPricing content-id
+            (merge pricing {
+                sales-count: (+ (get sales-count pricing) u1),
+                total-revenue: (+ (get total-revenue pricing) price),
+            })
+        )
+        (map-set CreatorEarnings creator {
+            total-earned: (+ (get total-earned earnings) net),
+            total-sales: (+ (get total-sales earnings) u1),
+            content-sold: (+ (get content-sold earnings) u1),
+        })
+        (var-set total-marketplace-volume
+            (+ (var-get total-marketplace-volume) price)
+        )
+        (ok true)
+    )
+)
+
+(define-read-only (get-content-pricing (content-id uint))
+    (ok (map-get? ContentPricing content-id))
+)
+
+(define-read-only (has-purchased
+        (buyer principal)
+        (content-id uint)
+    )
+    (ok (is-some (map-get? ContentPurchases {
+        buyer: buyer,
+        content-id: content-id,
+    })))
+)
+
+(define-public (update-marketplace-fee-rate (new-fee uint))
+    (begin
+        (asserts! (is-eq tx-sender (var-get dao-owner)) ERR-NOT-AUTHORIZED)
+        (asserts! (<= new-fee u5000) ERR-INVALID-INPUT)
+        (var-set marketplace-fee-rate new-fee)
+        (ok true)
+    )
+)
+
+(define-read-only (get-marketplace-stats)
+    (ok {
+        fee-rate: (var-get marketplace-fee-rate),
+        total-volume: (var-get total-marketplace-volume),
+    })
+)
+
+(define-read-only (get-creator-earnings (creator principal))
+    (ok (default-to {
+        total-earned: u0,
+        total-sales: u0,
+        content-sold: u0,
+    }
+        (map-get? CreatorEarnings creator)
+    ))
+)
+
 (define-public (create-proposal
         (title (string-ascii 100))
         (description (string-ascii 500))
@@ -941,18 +1062,15 @@
 ;; Find compatible exchange partner
 (define-public (find-exchange-match (target-language (string-ascii 10)))
     (let (
-            (requester-profile (unwrap! (map-get? LanguageProfiles tx-sender)
-                ERR-PROFILE-NOT-FOUND
-            ))
+            (requester-profile (unwrap! (map-get? LanguageProfiles tx-sender) ERR-PROFILE-NOT-FOUND))
             (requester-natives (get native-languages requester-profile))
-            (potential-matches (find-compatible-partners tx-sender target-language
-                requester-natives
-            ))
+            (potential-matches (find-compatible-partners tx-sender target-language requester-natives))
         )
         (asserts! (get active requester-profile) ERR-NOT-AUTHORIZED)
-        (asserts! (is-some (index-of (get learning-languages requester-profile)
-            target-language
-        )) ERR-INVALID-INPUT)
+        (asserts!
+            (is-some (index-of (get learning-languages requester-profile) target-language))
+            ERR-INVALID-INPUT
+        )
         (match potential-matches
             some-match (begin
                 (let (
@@ -987,12 +1105,8 @@
     )
     (let (
             (session-id (+ (var-get session-counter) u1))
-            (requester-profile (unwrap! (map-get? LanguageProfiles tx-sender)
-                ERR-PROFILE-NOT-FOUND
-            ))
-            (partner-profile (unwrap! (map-get? LanguageProfiles partner)
-                ERR-PROFILE-NOT-FOUND
-            ))
+            (requester-profile (unwrap! (map-get? LanguageProfiles tx-sender) ERR-PROFILE-NOT-FOUND))
+            (partner-profile (unwrap! (map-get? LanguageProfiles partner) ERR-PROFILE-NOT-FOUND))
             (duration (get preferred-session-length requester-profile))
         )
         (asserts! (not (is-eq tx-sender partner)) ERR-CANNOT-MATCH-SELF)
@@ -1025,9 +1139,7 @@
         (completion-notes (string-ascii 300))
     )
     (let (
-            (session (unwrap! (map-get? ExchangeSessions session-id)
-                ERR-SESSION-NOT-FOUND
-            ))
+            (session (unwrap! (map-get? ExchangeSessions session-id) ERR-SESSION-NOT-FOUND))
             (is-participant1 (is-eq tx-sender (get participant1 session)))
             (is-participant2 (is-eq tx-sender (get participant2 session)))
         )
@@ -1040,8 +1152,14 @@
             (merge session {
                 status: "completed",
                 completion-time: stacks-block-height,
-                notes2: (if is-participant2 completion-notes (get notes2 session)),
-                notes1: (if is-participant1 completion-notes (get notes1 session)),
+                notes2: (if is-participant2
+                    completion-notes
+                    (get notes2 session)
+                ),
+                notes1: (if is-participant1
+                    completion-notes
+                    (get notes1 session)
+                ),
             })
         )
         (unwrap-panic (update-session-stats tx-sender))
@@ -1060,9 +1178,7 @@
         (feedback (string-ascii 200))
     )
     (let (
-            (session (unwrap! (map-get? ExchangeSessions session-id)
-                ERR-SESSION-NOT-FOUND
-            ))
+            (session (unwrap! (map-get? ExchangeSessions session-id) ERR-SESSION-NOT-FOUND))
             (rating-key {
                 session-id: session-id,
                 rater: tx-sender,
@@ -1123,7 +1239,9 @@
         )
         ;; Simplified match logic - in production would check all profiles
         ;; for language compatibility and reputation requirements
-        (if (>= (get-user-reputation dummy-partner) (var-get min-reputation-for-matching))
+        (if (>= (get-user-reputation dummy-partner)
+                (var-get min-reputation-for-matching)
+            )
             (some dummy-partner)
             none
         )
@@ -1131,16 +1249,17 @@
 )
 
 ;; Calculate match compatibility score
-(define-private (calculate-match-score (user1 principal) (user2 principal))
+(define-private (calculate-match-score
+        (user1 principal)
+        (user2 principal)
+    )
     (let (
             (profile1 (unwrap-panic (map-get? LanguageProfiles user1)))
             (profile2 (unwrap-panic (map-get? LanguageProfiles user2)))
         )
         ;; Simplified scoring based on reputation and total sessions
-        (+ (get exchange-reputation profile1)
-           (get exchange-reputation profile2)
-           (get total-sessions profile1)
-           (get total-sessions profile2)
+        (+ (get exchange-reputation profile1) (get exchange-reputation profile2)
+            (get total-sessions profile1) (get total-sessions profile2)
         )
     )
 )
@@ -1153,17 +1272,14 @@
     )
     ;; Simplified availability check - would check existing sessions in real impl
     (let ((end-time (+ requested-time duration)))
-        (< (- end-time requested-time) u288) ;; Max 2 days in blocks
+        (< (- end-time requested-time) u288)
+        ;; Max 2 days in blocks
     )
 )
 
 ;; Update session statistics for participant
 (define-private (update-session-stats (participant principal))
-    (let (
-            (current-profile (unwrap! (map-get? LanguageProfiles participant)
-                ERR-PROFILE-NOT-FOUND
-            ))
-        )
+    (let ((current-profile (unwrap! (map-get? LanguageProfiles participant) ERR-PROFILE-NOT-FOUND)))
         (map-set LanguageProfiles participant
             (merge current-profile {
                 total-sessions: (+ (get total-sessions current-profile) u1),
@@ -1175,11 +1291,12 @@
 )
 
 ;; Update partner reputation based on rating
-(define-private (update-partner-reputation (partner principal) (rating uint))
+(define-private (update-partner-reputation
+        (partner principal)
+        (rating uint)
+    )
     (let (
-            (current-profile (unwrap! (map-get? LanguageProfiles partner)
-                ERR-PROFILE-NOT-FOUND
-            ))
+            (current-profile (unwrap! (map-get? LanguageProfiles partner) ERR-PROFILE-NOT-FOUND))
             (current-avg (get avg-rating current-profile))
             (sessions (get total-sessions current-profile))
             ;; Simple average calculation
@@ -1189,9 +1306,7 @@
             ))
         )
         (map-set LanguageProfiles partner
-            (merge current-profile {
-                avg-rating: new-avg,
-            })
+            (merge current-profile { avg-rating: new-avg })
         )
         (ok true)
     )
@@ -1248,12 +1363,10 @@
         (description (string-ascii 100))
         (sessions-required uint)
     )
-    (let (
-            (achievement-key {
-                participant: participant,
-                achievement-type: achievement-type,
-            })
-        )
+    (let ((achievement-key {
+            participant: participant,
+            achievement-type: achievement-type,
+        }))
         (if (is-none (map-get? ExchangeAchievements achievement-key))
             (map-set ExchangeAchievements achievement-key {
                 earned-date: stacks-block-height,
@@ -1352,7 +1465,8 @@
 (define-read-only (get-exchange-stats (user principal))
     (let ((profile (map-get? LanguageProfiles user)))
         (ok (match profile
-            some-profile {
+            some-profile
+            {
                 total-sessions: (get total-sessions some-profile),
                 avg-rating: (get avg-rating some-profile),
                 exchange-reputation: (get exchange-reputation some-profile),
@@ -1387,9 +1501,7 @@
 (define-public (deactivate-exchange-profile (user principal))
     (let ((profile (unwrap! (map-get? LanguageProfiles user) ERR-PROFILE-NOT-FOUND)))
         (asserts! (is-eq tx-sender (var-get dao-owner)) ERR-NOT-AUTHORIZED)
-        (map-set LanguageProfiles user
-            (merge profile { active: false })
-        )
+        (map-set LanguageProfiles user (merge profile { active: false }))
         (ok true)
     )
 )
